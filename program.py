@@ -169,3 +169,173 @@ def classify_dt(training_file, testing_file):
 
     return [classify_instance(tree, inst) for inst in testing]
 
+
+# ── KNN+ ──────────────────────────────────────────────────────────────────────
+
+def _ig_weights(training):
+    """Compute sqrt-information-gain weights for each feature.
+
+    Square-root scaling keeps strong predictors important without letting one
+    attribute completely dominate the distance.
+    """
+    n = len(training[0][0])
+    raw = [math.sqrt(max(information_gain(training, i), 0.0)) for i in range(n)]
+    total = sum(raw)
+    if total == 0:
+        return [1.0] * n
+    # Normalise so weights sum to n - a feature with average signal gets weight 1
+    return [w / total * n for w in raw]
+
+
+def _vdm_tables(training, alpha=1):
+    """Pre-compute Value Difference Metric probability tables.
+
+    For each feature value, store P(class | value). Laplace smoothing avoids
+    over-trusting rare values in this small dataset.
+    """
+    labels = sorted(set(label for _, label in training))
+    n_features = len(training[0][0])
+    value_counts = [Counter() for _ in range(n_features)]
+    class_counts = [{} for _ in range(n_features)]
+
+    for features, label in training:
+        for i, value in enumerate(features):
+            value_counts[i][value] += 1
+            class_counts[i].setdefault(value, Counter())[label] += 1
+
+    global_counts = Counter(label for _, label in training)
+    global_probs = {
+        label: (global_counts[label] + alpha) / (len(training) + alpha * len(labels))
+        for label in labels
+    }
+
+    tables = []
+    for i in range(n_features):
+        feature_table = {}
+        for value, count in value_counts[i].items():
+            denom = count + alpha * len(labels)
+            feature_table[value] = {
+                label: (class_counts[i][value][label] + alpha) / denom
+                for label in labels
+            }
+        tables.append(feature_table)
+
+    return labels, tables, global_probs
+
+
+def _vdm_distance(a, b, labels, tables, global_probs, weights):
+    """Value Difference Metric distance for categorical data."""
+    total = 0.0
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x == y:
+            continue
+        x_probs = tables[i].get(x, global_probs)
+        y_probs = tables[i].get(y, global_probs)
+        value_diff = sum(abs(x_probs[label] - y_probs[label]) for label in labels)
+        total += weights[i] * value_diff * value_diff
+    return math.sqrt(total)
+
+
+def classify_knn_plus(training_filename, testing_filename, k=21):
+    """KNN+: Value Difference Metric + sqrt-information-gain feature weighting.
+
+    VDM is designed for categorical data: two different values are considered
+    close if they have similar class distributions in the training set. For
+    this heart-failure dataset, that means values are compared by how similarly
+    they predict 'died' or 'survived', rather than by a plain mismatch.
+
+    Tie-breaking:
+      • Distance ties: lower training-row index wins (stable sort).
+      • Voting ties: predict 'died'.
+    """
+    training = load_data(training_filename, has_class=True)
+    testing  = load_data(testing_filename,  has_class=False)
+
+    weights = _ig_weights(training)
+    labels, tables, global_probs = _vdm_tables(training)
+
+    results = []
+    for test_instance in testing:
+        distances = []
+        for row_idx, (features, label) in enumerate(training):
+            d = _vdm_distance(test_instance, features, labels, tables, global_probs, weights)
+            distances.append((d, row_idx, label))
+
+        distances.sort(key=lambda x: (x[0], x[1]))
+        k_nearest = distances[:k]
+        votes = Counter(label for _, _, label in k_nearest)
+
+        max_votes = max(votes.values())
+        if list(votes.values()).count(max_votes) > 1:
+            prediction = 'died'
+        else:
+            prediction = max(votes, key=lambda c: votes[c])
+        results.append(prediction)
+
+    return results
+
+
+# ── DT+ ───────────────────────────────────────────────────────────────────────
+
+def build_tree_plus(examples, feature_indices, default, max_depth, depth=0):
+    """ID3 decision tree with max-depth pre-pruning.
+
+    Identical to build_tree except: once max_depth is reached, stop splitting
+    and return the current majority class. This keeps only the strongest
+    high-level rules and avoids fitting tiny patient subgroups.
+    """
+    if not examples:
+        return default
+
+    labels = [label for _, label in examples]
+
+    if len(set(labels)) == 1:
+        return labels[0]
+
+    # Pre-pruning: stop before the tree becomes too specific
+    if depth >= max_depth:
+        return majority_class(examples)
+
+    if not feature_indices:
+        return majority_class(examples)
+
+    best_idx = max(feature_indices, key=lambda i: information_gain(examples, i))
+    node_default = majority_class(examples)
+    remaining    = [i for i in feature_indices if i != best_idx]
+
+    node = {
+        'feature':  best_idx,
+        'default':  node_default,
+        'children': {}
+    }
+
+    for value in sorted(set(features[best_idx] for features, _ in examples)):
+        subset = [(f, l) for f, l in examples if f[best_idx] == value]
+        node['children'][value] = build_tree_plus(
+            subset, remaining, node_default, max_depth, depth + 1
+        )
+
+    return node
+
+
+def classify_dt_plus(training_filename, testing_filename, max_depth=2):
+    """DT+: ID3 with max-depth pre-pruning.
+
+    Improvement over plain ID3:
+      The tree is only allowed to grow to max_depth. This is useful here
+      because the dataset has only ~300 patients and multi-way categorical
+      splits can quickly create small, noisy branches. A shallow tree keeps
+      the strongest rules and reduces overfitting.
+    """
+    training = load_data(training_filename, has_class=True)
+    testing  = load_data(testing_filename,  has_class=False)
+
+    if not training:
+        return []
+
+    n_features = len(training[0][0])
+    default    = majority_class(training)
+    tree       = build_tree_plus(training, list(range(n_features)), default, max_depth)
+
+    return [classify_instance(tree, inst) for inst in testing]
+
